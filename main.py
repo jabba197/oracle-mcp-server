@@ -57,24 +57,24 @@ print("FastMCP server initialized", file=sys.stderr)
 @mcp.tool()
 async def get_table_schema(table_name: str, ctx: Context) -> str:
     """
-    Get the schema information for a specific table including columns, data types, nullability, and relationships.
-    Use this when you need to understand the structure of a particular table to write queries against it or to analyze data models.
+    Get the schema information for a specific table or view including columns, data types, nullability, and relationships.
+    Use this when you need to understand the structure of a particular table or view to write queries against it or to analyze data models.
     This tool is particularly useful before writing complex SQL queries, designing new tables, or establishing relationships between existing tables.
-    The table name parameter is case-insensitive, so 'CUSTOMERS', 'customers', and 'Customers' will all retrieve the same table.
+    The table/view name parameter is case-insensitive, so 'CUSTOMERS', 'customers', and 'Customers' will all retrieve the same object.
     
     Args:
-        table_name: The name of the table to get schema information for (case-insensitive). Must be an exact table name,
+        table_name: The name of the table or view to get schema information for (case-insensitive). Must be an exact table/view name,
                    as this tool does not support partial matches or wildcards. For pattern matching, use search_tables_schema instead.
     
     Returns:
-        A formatted string containing the table's schema information including columns (with data types and nullability)
-        and relationships to other tables. Returns an error message if the table is not found in the database schema.
+        A formatted string containing the table/view's schema information including columns (with data types and nullability)
+        and relationships to other tables (for tables only). Returns an error message if the table or view is not found in the database schema.
     """
     db_context: DatabaseContext = ctx.request_context.lifespan_context
     table_info = await db_context.get_schema_info(table_name)
     
     if not table_info:
-        return f"Table '{table_name}' not found in the schema."
+        return f"Table or view '{table_name}' not found in the schema."
     
     # Delegate formatting to the TableInfo model
     return table_info.format_schema()
@@ -106,23 +106,23 @@ async def rebuild_schema_cache(ctx: Context) -> str:
 @mcp.tool()
 async def get_tables_schema(table_names: List[str], ctx: Context) -> str:
     """
-    Get the schema information for multiple tables at once in a single database query.
+    Get the schema information for multiple tables or views at once in a single database query.
     This tool is significantly more efficient than calling get_table_schema multiple times as it
     reduces network round-trips and database load. Use this tool whenever you need information
-    about two or more tables, especially when analyzing relationships across tables or designing queries
+    about two or more tables/views, especially when analyzing relationships across tables or designing queries
     that join multiple tables.
     
-    There is no hard limit on how many tables can be requested, but requesting too many large tables
-    at once may cause performance issues. If a requested table doesn't exist, an error message for that
-    specific table will be included in the results while still returning information for valid tables.
+    There is no hard limit on how many tables/views can be requested, but requesting too many large objects
+    at once may cause performance issues. If a requested table or view doesn't exist, an error message for that
+    specific object will be included in the results while still returning information for valid objects.
     
     Args:
-        table_names: A list of table names to get schema information for (case-insensitive). Each name
+        table_names: A list of table or view names to get schema information for (case-insensitive). Each name
                     must be exact, as this tool does not support partial matches or wildcards.
     
     Returns:
-        A formatted string containing the schema information for all requested tables, including
-        columns (with data types and nullability) and relationships for each table. Tables are
+        A formatted string containing the schema information for all requested tables/views, including
+        columns (with data types and nullability) and relationships (for tables only). Objects are
         grouped and clearly separated in the output.
     """
     db_context: DatabaseContext = ctx.request_context.lifespan_context
@@ -131,7 +131,7 @@ async def get_tables_schema(table_names: List[str], ctx: Context) -> str:
     for table_name in table_names:
         table_info = await db_context.get_schema_info(table_name)
         if not table_info:
-            results.append(f"\nTable '{table_name}' not found in the schema.")
+            results.append(f"\nTable or view '{table_name}' not found in the schema.")
             continue
         
         # Delegate formatting to the TableInfo model
@@ -142,24 +142,25 @@ async def get_tables_schema(table_names: List[str], ctx: Context) -> str:
 @mcp.tool()
 async def search_tables_schema(search_term: str, ctx: Context) -> str:
     """
-    Search for tables with names similar to the provided search terms and return their schema information.
-    Multiple terms can be provided separated by commas or whitespace to find tables matching any of the terms.
-    Use this tool when you aren't sure of the exact table name but know part of it, or when exploring tables 
+    Search for tables or views with names similar to the provided search terms and return their schema information.
+    Multiple terms can be provided separated by commas or whitespace to find tables/views matching any of the terms.
+    Use this tool when you aren't sure of the exact table/view name but know part of it, or when exploring objects 
     related to a specific domain or function like 'customer', 'order', or 'inventory'.
     
-    The search is case-insensitive and matches substrings anywhere in the table name. For example, searching
-    for 'cust' will match 'CUSTOMERS', 'customer_data', and 'historical_customer_orders'. Warning: results are limited
-    to 20 tables total across all search terms to prevent overwhelming responses for generic terms. This means that if 
-    too many tables are matched, only the first 20 will be returned, which may lead to missing very relevant tables. So, 
-    if you encounter this, try to be more specific with your search terms and consider there may be more relevant tables.
+    The search is case-insensitive and matches substrings anywhere in the object name. For example, searching
+    for 'cust' will match 'CUSTOMERS', 'customer_data', 'vw_customer_lifetime_value', and 'historical_customer_orders'. 
+    Warning: results are limited to 20 objects total across all search terms to prevent overwhelming responses for generic terms. 
+    This means that if too many objects are matched, only the first 20 will be returned, which may lead to missing very relevant 
+    tables or views. So, if you encounter this, try to be more specific with your search terms and consider there may be more 
+    relevant objects.
     
     Args:
-        search_term: One or more strings to search for in table names (case-insensitive), separated by commas or spaces.
+        search_term: One or more strings to search for in table/view names (case-insensitive), separated by commas or spaces.
                      Each term is treated as a separate search, with results combined (logical OR).
     
     Returns:
-        A formatted string containing the schema information for all matching tables (up to 20 tables total),
-        including column definitions and relationships for each table. If no matches are found, returns an
+        A formatted string containing the schema information for all matching tables/views (up to 20 objects total),
+        including column definitions and relationships (for tables only). If no matches are found, returns an
         error message listing which terms were searched.
     """
     db_context: DatabaseContext = ctx.request_context.lifespan_context
@@ -251,22 +252,22 @@ async def get_database_vendor_info(ctx: Context) -> str:
 @mcp.tool()
 async def search_columns(search_term: str, ctx: Context) -> str:
     """
-    Search for tables containing columns that match the provided search term in their name.
+    Search for tables and views containing columns that match the provided search term in their name.
     This tool is extremely useful when you know what data you need (like 'customer_id' or 'order_date') 
-    but aren't sure which tables contain this information. Essential for exploring large databases and
-    understanding data relationships without having to examine each table individually.
+    but aren't sure which tables or views contain this information. Essential for exploring large databases and
+    understanding data relationships without having to examine each object individually.
     
     The search is case-insensitive and matches substrings anywhere in the column name. Results are limited
-    to 50 column matches across all tables to prevent overwhelming responses. For each matching column, the
-    tool returns the table name, column name, data type, and nullability status, helping you identify
-    the right tables to query for specific data.
+    to 50 column matches across all tables/views to prevent overwhelming responses. For each matching column, the
+    tool returns the table/view name, column name, data type, and nullability status, helping you identify
+    the right objects to query for specific data.
     
     Args:
         search_term: A string to search for in column names (case-insensitive). For example, 'address',
                     'date', 'amount', etc. Does not support wildcards or regex patterns.
     
     Returns:
-        A formatted string listing tables and their matching columns (up to 50 results) with data types
+        A formatted string listing tables/views and their matching columns (up to 50 results) with data types
         and nullability information. Returns an error message if no matches are found or an error occurs.
     """
     db_context: DatabaseContext = ctx.request_context.lifespan_context
@@ -277,10 +278,10 @@ async def search_columns(search_term: str, ctx: Context) -> str:
         if not matching_columns:
             return f"No columns found matching '{search_term}'"
         
-        results = [f"Found columns matching '{search_term}' in {len(matching_columns)} tables:"]
+        results = [f"Found columns matching '{search_term}' in {len(matching_columns)} tables/views:"]
         
         for table_name, columns in matching_columns.items():
-            results.append(f"\nTable: {table_name}")
+            results.append(f"\nTable/View: {table_name}")
             results.append("Matching columns:")
             for col in columns:
                 nullable = "NULL" if col["nullable"] else "NOT NULL"

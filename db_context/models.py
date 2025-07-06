@@ -9,17 +9,19 @@ class TableInfo:
     columns: List[Dict[str, Any]]
     relationships: Dict[str, Dict[str, Any]]
     fully_loaded: bool = False
+    object_type: str = "TABLE"  # Can be "TABLE" or "VIEW"
 
     def format_schema(self) -> str:
-        """Format the schema information for the table, with smart relationship grouping.
+        """Format the schema information for the table or view, with smart relationship grouping.
         
         Returns:
-            A formatted string containing the table's complete schema information.
+            A formatted string containing the object's complete schema information.
         """
         return format_schema(
             self.table_name,
             self.columns,
-            self.relationships
+            self.relationships,
+            self.object_type
         )
 
 @dataclass

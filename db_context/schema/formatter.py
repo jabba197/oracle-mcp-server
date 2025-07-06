@@ -94,9 +94,10 @@ COLUMN_GROUPING_THRESHOLD = 20     # Number of columns before compact format is 
 MIN_PREFIX_LENGTH = 3              # Minimum length for meaningful prefix grouping
 
 def format_schema(table_name: str, columns: List[Dict[str, Any]], 
-                relationships: Dict[str, Dict[str, Any]]) -> str:
-    """Format complete schema information for a table."""
-    result = [f"\nTable: {table_name}"]
+                relationships: Dict[str, Dict[str, Any]], 
+                object_type: str = "TABLE") -> str:
+    """Format complete schema information for a table or view."""
+    result = [f"\n{object_type}: {table_name}"]
     
     # Format columns with automatic compaction for large column sets
     result.append("Columns:")

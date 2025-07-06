@@ -137,6 +137,7 @@ class SchemaManager(SchemaManagerProtocol):
         # Check if we have the table in our cache
         if table_name not in self.cache.tables:
             self.cache.tables[table_name] = TableInfo(
+                table_name=table_name,
                 columns=[], 
                 relationships={}, 
                 fully_loaded=False
@@ -151,7 +152,8 @@ class SchemaManager(SchemaManagerProtocol):
                     table_name=table_name,
                     columns=table_details["columns"],
                     relationships=table_details["relationships"],
-                    fully_loaded=True
+                    fully_loaded=True,
+                    object_type=table_details.get("object_type", "TABLE")
                 )
                 self.cache.tables[table_name] = table_info
                 # Save the updated cache to disk

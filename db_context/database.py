@@ -2,8 +2,9 @@ import sys
 import oracledb
 import time
 import asyncio
-from typing import Dict, List, Set, Optional, Any
+from typing import Dict, List, Set, Optional, Any, Tuple
 from pathlib import Path
+from difflib import SequenceMatcher
 from .models import SchemaManager
 
 class DatabaseConnector:
@@ -162,50 +163,126 @@ class DatabaseConnector:
         finally:
             await self._close_connection(conn)
 
+    async def _execute_with_fallback(self, cursor, all_query: str, user_query: str, 
+                                    **params) -> List[Tuple]:
+        """Execute query with ALL_* views, fallback to USER_* views if needed"""
+        try:
+            # Try ALL_* views first
+            return await self._execute_cursor(cursor, all_query, **params)
+        except oracledb.DatabaseError as e:
+            error_obj, = e.args
+            if error_obj.code == 1031:  # ORA-01031: insufficient privileges
+                print(f"Permission denied for ALL_* views, trying USER_* views", file=sys.stderr)
+                # Try USER_* views as fallback
+                try:
+                    return await self._execute_cursor(cursor, user_query, **params)
+                except oracledb.DatabaseError as e2:
+                    error_obj2, = e2.args
+                    if error_obj2.code == 1031:
+                        print(f"No access to dictionary views", file=sys.stderr)
+                        return []
+                    raise
+            raise
+
+    def _calculate_similarity(self, s1: str, s2: str) -> float:
+        """Calculate similarity between two strings using SequenceMatcher"""
+        return SequenceMatcher(None, s1.upper(), s2.upper()).ratio()
+
+    def _filter_by_similarity(self, items: List[str], search_term: str, 
+                            threshold: float = 0.65) -> List[Tuple[str, float]]:
+        """Client-side fuzzy matching to replace UTL_MATCH"""
+        results = []
+        search_upper = search_term.upper()
+        
+        for item in items:
+            # Direct substring match first
+            if search_upper in item.upper():
+                results.append((item, 1.0))
+            else:
+                # Calculate similarity
+                similarity = self._calculate_similarity(item, search_term)
+                if similarity >= threshold:
+                    results.append((item, similarity))
+        
+        # Sort by similarity descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
     async def get_all_table_names(self) -> Set[str]:
-        """Get a list of all table names in the database using optimized query"""
+        """Get a list of all table and view names in the database with permission handling"""
         conn = await self.get_connection()
         try:
-            print("Getting list of all tables...", file=sys.stderr)
+            print("Getting list of all tables and views...", file=sys.stderr)
             cursor = conn.cursor()
             schema = await self._get_effective_schema(conn)
-            # Using RESULT_CACHE hint for frequently accessed data
-            all_tables = await self._execute_cursor(
+            
+            # Try ALL_OBJECTS first (most comprehensive)
+            all_objects_query = """
+                SELECT /*+ RESULT_CACHE */ object_name 
+                FROM all_objects 
+                WHERE owner = :owner 
+                AND object_type IN ('TABLE', 'VIEW')
+                ORDER BY object_name
+            """
+            
+            # Fallback to USER_TABLES and USER_VIEWS
+            user_objects_query = """
+                SELECT table_name AS object_name FROM user_tables
+                UNION ALL
+                SELECT view_name AS object_name FROM user_views
+                ORDER BY object_name
+            """
+            
+            # Execute with fallback
+            objects = await self._execute_with_fallback(
                 cursor,
-                """
-                SELECT /*+ RESULT_CACHE */ table_name 
-                FROM all_tables 
-                WHERE owner = :owner
-                ORDER BY table_name
-                """,
+                all_objects_query,
+                user_objects_query,
                 owner=schema
             )
             
-            return {t[0] for t in all_tables}
+            if not objects:
+                print("Warning: Could not retrieve any tables or views. Check permissions.", file=sys.stderr)
+            
+            return {obj[0] for obj in objects}
         finally:
             await self._close_connection(conn)
     
     async def load_table_details(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """Load detailed schema information for a specific table with optimized queries"""
+        """Load detailed schema information for a specific table or view with optimized queries"""
         conn = await self.get_connection()
         try:
             cursor = conn.cursor()
             schema = await self._get_effective_schema(conn)
             
-            # Check if the table exists using result cache
-            table_exists = await self._execute_cursor(
+            # Check if the object exists and get its type
+            object_check_query = """
+                SELECT /*+ RESULT_CACHE */ object_type 
+                FROM all_objects 
+                WHERE owner = :owner 
+                AND object_name = :object_name
+                AND object_type IN ('TABLE', 'VIEW')
+            """
+            
+            # Fallback query for USER objects
+            user_object_check_query = """
+                SELECT 'TABLE' AS object_type FROM user_tables WHERE table_name = :object_name
+                UNION ALL
+                SELECT 'VIEW' AS object_type FROM user_views WHERE view_name = :object_name
+            """
+            
+            object_info = await self._execute_with_fallback(
                 cursor,
-                """
-                SELECT /*+ RESULT_CACHE */ COUNT(*) 
-                FROM all_tables 
-                WHERE owner = :owner AND table_name = :table_name
-                """,
-                owner=schema, 
-                table_name=table_name.upper()
+                object_check_query,
+                user_object_check_query,
+                owner=schema,
+                object_name=table_name.upper()
             )
             
-            if table_exists[0][0] == 0:
+            if not object_info:
                 return None
+            
+            object_type = object_info[0][0]
                 
             # Get column information using result cache and index hints
             columns = await self._execute_cursor(
@@ -229,61 +306,63 @@ class DatabaseConnector:
                     "nullable": nullable == 'Y'
                 })
             
-            # Get relationship information using optimized join order and result cache
-            relationships = await self._execute_cursor(
-                cursor,
-                """
-                SELECT /*+ RESULT_CACHE */
-                    'OUTGOING' AS relationship_direction,
-                    acc.column_name AS source_column,
-                    rcc.table_name AS referenced_table,
-                    rcc.column_name AS referenced_column
-                FROM all_constraints ac
-                JOIN all_cons_columns acc ON acc.constraint_name = ac.constraint_name
-                                        AND acc.owner = ac.owner
-                JOIN all_cons_columns rcc ON rcc.constraint_name = ac.r_constraint_name
-                                        AND rcc.owner = ac.r_owner
-                WHERE ac.constraint_type = 'R'
-                AND ac.owner = :owner
-                AND ac.table_name = :table_name
-
-                UNION ALL
-
-                SELECT /*+ RESULT_CACHE */
-                    'INCOMING' AS relationship_direction,
-                    rcc.column_name AS source_column,
-                    ac.table_name AS referenced_table,
-                    acc.column_name AS referenced_column
-                FROM all_constraints ac
-                JOIN all_cons_columns acc ON acc.constraint_name = ac.constraint_name
-                                        AND acc.owner = ac.owner
-                JOIN all_cons_columns rcc ON rcc.constraint_name = ac.r_constraint_name
-                                        AND rcc.owner = ac.r_owner
-                WHERE ac.constraint_type = 'R'
-                AND ac.r_owner = :owner
-                AND ac.r_constraint_name IN (
-                    SELECT constraint_name 
-                    FROM all_constraints
-                    WHERE owner = :owner
-                    AND table_name = :table_name
-                    AND constraint_type IN ('P', 'U')
-                )
-                """,
-                owner=schema, 
-                table_name=table_name.upper()
-            )
-            
+            # Get relationship information only for tables (views don't have FK constraints)
             relationship_info = {}
-            for direction, column, ref_table, ref_column in relationships:
-                if ref_table not in relationship_info:
-                    relationship_info[ref_table] = []
-                relationship_info[ref_table].append({
-                    "local_column": column,
-                    "foreign_column": ref_column,
-                    "direction": direction
-                })
+            if object_type == 'TABLE':
+                relationships = await self._execute_cursor(
+                    cursor,
+                    """
+                    SELECT /*+ RESULT_CACHE */
+                        'OUTGOING' AS relationship_direction,
+                        acc.column_name AS source_column,
+                        rcc.table_name AS referenced_table,
+                        rcc.column_name AS referenced_column
+                    FROM all_constraints ac
+                    JOIN all_cons_columns acc ON acc.constraint_name = ac.constraint_name
+                                            AND acc.owner = ac.owner
+                    JOIN all_cons_columns rcc ON rcc.constraint_name = ac.r_constraint_name
+                                            AND rcc.owner = ac.r_owner
+                    WHERE ac.constraint_type = 'R'
+                    AND ac.owner = :owner
+                    AND ac.table_name = :table_name
+
+                    UNION ALL
+
+                    SELECT /*+ RESULT_CACHE */
+                        'INCOMING' AS relationship_direction,
+                        rcc.column_name AS source_column,
+                        ac.table_name AS referenced_table,
+                        acc.column_name AS referenced_column
+                    FROM all_constraints ac
+                    JOIN all_cons_columns acc ON acc.constraint_name = ac.constraint_name
+                                            AND acc.owner = ac.owner
+                    JOIN all_cons_columns rcc ON rcc.constraint_name = ac.r_constraint_name
+                                            AND rcc.owner = ac.r_owner
+                    WHERE ac.constraint_type = 'R'
+                    AND ac.r_owner = :owner
+                    AND ac.r_constraint_name IN (
+                        SELECT constraint_name 
+                        FROM all_constraints
+                        WHERE owner = :owner
+                        AND table_name = :table_name
+                        AND constraint_type IN ('P', 'U')
+                    )
+                    """,
+                    owner=schema, 
+                    table_name=table_name.upper()
+                )
+                
+                for direction, column, ref_table, ref_column in relationships:
+                    if ref_table not in relationship_info:
+                        relationship_info[ref_table] = []
+                    relationship_info[ref_table].append({
+                        "local_column": column,
+                        "foreign_column": ref_column,
+                        "direction": direction
+                    })
                 
             return {
+                "object_type": object_type,
                 "columns": column_info,
                 "relationships": relationship_info
             }
@@ -650,37 +729,42 @@ class DatabaseConnector:
             await self._close_connection(conn)
     
     async def search_in_database(self, search_term: str, limit: int = 20) -> List[str]:
-        """Search for table names in the database using similarity matching"""
+        """Search for table and view names in the database using client-side similarity matching"""
         conn = await self.get_connection()
         try:
             cursor = conn.cursor()
             schema = await self._get_effective_schema(conn)
-            # Use Oracle's built-in similarity features
-            results = await self._execute_cursor(cursor, """
-                SELECT /*+ RESULT_CACHE */ DISTINCT table_name 
-                FROM all_tables 
-                WHERE owner = :owner
-                AND (
-                    -- Direct matches first
-                    UPPER(table_name) LIKE '%' || :search_term || '%'
-                    -- Then similar names using built-in similarity calculation
-                    OR UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                        UPPER(table_name),
-                        :search_term
-                    ) > 65  -- Minimum similarity threshold (65%)
-                )
-                ORDER BY 
-                    CASE 
-                        WHEN UPPER(table_name) LIKE '%' || :search_term || '%' THEN 0
-                        ELSE 1
-                    END,
-                    UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                        UPPER(table_name),
-                        :search_term
-                    ) DESC
-            """, owner=schema, search_term=search_term.upper())
             
-            return [row[0] for row in results][:limit]
+            # Get all tables and views
+            all_objects_query = """
+                SELECT /*+ RESULT_CACHE */ object_name 
+                FROM all_objects 
+                WHERE owner = :owner 
+                AND object_type IN ('TABLE', 'VIEW')
+            """
+            
+            user_objects_query = """
+                SELECT table_name AS object_name FROM user_tables
+                UNION ALL
+                SELECT view_name AS object_name FROM user_views
+            """
+            
+            # Get all objects with permission fallback
+            all_objects = await self._execute_with_fallback(
+                cursor,
+                all_objects_query,
+                user_objects_query,
+                owner=schema
+            )
+            
+            # Extract object names
+            object_names = [obj[0] for obj in all_objects]
+            
+            # Use client-side similarity matching
+            matched_objects = self._filter_by_similarity(object_names, search_term)
+            
+            # Return just the names, limited by the limit parameter
+            return [name for name, _ in matched_objects][:limit]
             
         finally:
             await self._close_connection(conn)
